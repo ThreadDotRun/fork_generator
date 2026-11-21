@@ -1,5 +1,5 @@
 # /home/tdrsvr/Desktop/slop/fork_generator.py
-# fork_generator.py  (v9)
+# fork_generator.py  (v10)
 # Fork Generator, Executive Organelle 1. numpy only.
 #
 # Clocks
@@ -22,11 +22,15 @@
 #
 # Dissonance: on observe, z = mean(e^2)/unc is the surprise of the survivor against
 #   the current hot readout; bump_p += diss_gain * w * tanh(max(z - 1, 0)).
-#   tanh bounds each survivor's increment to diss_gain * w; bump_max caps the total
-#   (v7: v6 was unbounded, and a steady offset accumulated to ~36).
+#   tanh bounds each survivor's increment to diss_gain * w; bump_max caps the total.
+#   Valence (v10): dissonance is pain. Pain is a hold signal for persistent
+#   surprise and an accelerate signal for acute surprise. The two-timescale split
+#   (acute/tonic) is not yet implemented; until it is, bump_p carries the tonic
+#   role (persistence is what gem_gate reads). This is a declared bake-in.
 #
 # Ledger: open forks keyed by trajectory id, expiring after ttl in field-time.
-#   n_arr = n_folded + n_discarded + n_open, exact (n_discarded includes expiry).
+#   n_arr = n_folded + n_discarded + n_open, exact (n_discarded includes expiry
+#   and hallucinated-for-shit discard; the three discard paths are stated below).
 #
 # Antagonism: u_p = a_p + eta * n_p * (1 - pi_p);  pi = softmax(logits)
 #   logits_p <- logits_p + kappa_pi (u_p - ubar)   (v7: logit space; was multiplicative)
@@ -43,12 +47,23 @@
 #
 # Rejection boundary (v8): non-finite x or y is rejected at fork, infer, observe,
 #   settle, and ingest_corpus. settle validates BEFORE it consumes the ledger record,
-#   so a rejected outcome leaves the fork open and the ledger balanced.
+#   so a rejected outcome leaves the fork open and the ledger balanced. A provenance
+#   header naming a class not in PROVENANCE is rejected at fork.
 #
-# Settlement (v9): w = max(agree, surprise). Dissent is never quashed. A surprising
-#   outcome folds at full weight, the same order as agreement, and is overcome through
-#   the statistics, not gated out. Settlement never discards; discards come only from
-#   expiry and malformed input, which is why the feeder's rejection counts matter.
+# Settlement (v10): w = max(agree, surprise). Dissent is never quashed for observed
+#   and inferred outcomes. The hallucinated class is subject to the declared valence:
+#   persistent surprise is a gem (folded at full weight), one-off surprise is for-shit
+#   (discarded at settlement). The valence is a bake-in (DEFAULTS["valence"]), stated
+#   not derived. Discards come from three paths: expiry (field-time seizes), malformed
+#   input (feeder's verifier), and hallucinated-for-shit (this valence). The first two
+#   are structural; the third is the declared valence doing its job.
+#
+# Honored class (v10): fork() stores the class the fork was *asked to produce* on the
+#   ledger record (from conditioning_tags['provenance'], defaulting to the fork's own
+#   Proposal.provenance). settle() reads the honored class from the record; a caller
+#   may pass an explicit override for tests and mislabeling probes, but there is no
+#   silent "observed" default. The honored class is the sense-2 class (the accumulator
+#   the outcome folds into); Proposal.provenance remains the sense-1 self-description.
 #
 # Consolidation loss (unchanged from v5, gradient-checked):
 #   L = (1/B) sum_b w_b [ (1/F) sum_k 0.5(e^2 exp(-lv) + lv) + 0.5(e_s exp(lu) - lu) ]
@@ -85,6 +100,11 @@ PROVENANCE = ("observed", "inferred", "hallucinated")
 N_CLASS = len(PROVENANCE)
 
 # ---- bake-ins: fixed, not learned ----
+# Valence (declared, not derived): dissonance is pain. Pain is a hold signal for
+# persistent surprise and an accelerate signal for acute surprise. The organism is
+# born with this valence; it is not discovered from the firehose. The two-timescale
+# split (acute/tonic) is not yet implemented; until it is, `bump` carries the tonic
+# role (persistence is what the gem check reads).
 DEFAULTS = dict(
     kappa=0.05,          # consolidation step size
     kappa_hot=0.5,       # hot pull rate (times dt; must keep kappa_hot*dt < 1)
@@ -103,6 +123,12 @@ DEFAULTS = dict(
     ttl=50.0,            # open-fork lifetime in field-time
     phase_on=False,      # breath rotation on the hot path
     phase_base=10000.0,  # RoPE base frequency
+    # Gem valence (hallucinated class only). Persistent surprise is a hold; one-off
+    # surprise is for-shit and releases into discard. Thresholds are seeds for the
+    # running aggregate baseline, not eternal constants.
+    gem_bump=0.5,        # bump at or above this counts as persistent surprise
+    gem_support=2.0,     # support mass at or above this counts as kept-settling
+    valence="tonic_hold",  # declared valence; swapping this swaps the discard rule
 )
 
 
@@ -125,7 +151,7 @@ class Proposal:
     conditioning_tags: Dict[str, float]
     uncertainty: float                   # exp(-lu): expected squared error of mu
     origin_id: str = "fork_generator"
-    provenance: str = "inferred"
+    provenance: str = "inferred"         # sense-1 self-description (not the honored class)
 
 
 # ---- helpers ----
@@ -163,6 +189,11 @@ class ForkGenerator:
         cfg.update(overrides)
         if cfg["beta"] <= 0:
             raise ValueError("beta must be > 0")
+        if cfg["valence"] not in ("tonic_hold",):
+            # Only one valence is implemented. Adding a second is a deliberate
+            # change to the discard rule in settle(); the string is the switch.
+            raise ValueError(f"valence {cfg['valence']!r} not implemented; "
+                             f"only 'tonic_hold' is available")
         cfg.update(d_delta=d_delta, d_hum=d_hum, d_state=d_state, d_fork=d_fork,
                    hidden=hidden, seed=seed)
         self.cfg = cfg
@@ -480,10 +511,21 @@ class ForkGenerator:
 
     # ---- ledger ----
     def fork(self, x, phase=0.0, conditioning_tags=None):
-        """Emit a proposal and open a ledger record. Counts as an arrival."""
+        """Emit a proposal and open a ledger record. Counts as an arrival.
+
+        conditioning_tags may carry 'provenance' as a header: the class the fork
+        was *asked to produce*. The header is honored — it becomes the class the
+        settlement folds into, unless settle() is given an explicit override.
+        No default is invented; if no header, the fork's own provenance
+        ('inferred') is the honored class. A header naming a class not in
+        PROVENANCE is rejected at this boundary."""
         x = np.asarray(x, float).reshape(1, -1)
         if not np.all(np.isfinite(x)):
             raise ValueError("fork: non-finite input rejected")
+        tags = dict(conditioning_tags or {})
+        honored = tags.get("provenance", Proposal.provenance)
+        if honored not in PROVENANCE:
+            raise ValueError(f"fork: provenance header {honored!r} not in {PROVENANCE}")
         mu_raw, lv_raw, lu_raw = self._predict_raw(x, phase, hot=True)
         mu = np.clip(mu_raw[0], -MU_CLIP, MU_CLIP)
         lv = np.clip(lv_raw[0], LV_MIN, LV_MAX)
@@ -495,16 +537,31 @@ class ForkGenerator:
             x.tobytes() + f"|{self.n_arr}|{self.field_time:.9f}|{float(phase):.9f}".encode()
         ).hexdigest()[:12]
         self.ledger[tid] = dict(x=x[0].copy(), phase=float(phase), mu=mu.copy(),
-                                unc=unc, novelty=novelty, t0=self.field_time)
+                                unc=unc, novelty=novelty, t0=self.field_time,
+                                provenance=honored)
         self.n_arr += 1
         return Proposal(trajectory_id=tid,
                         proposal_weight=float(np.exp(-lv.mean())),
                         latent_trajectory=mu,
-                        conditioning_tags=dict(conditioning_tags or {}),
+                        conditioning_tags=tags,
                         uncertainty=unc)
 
-    def settle(self, tid, y, provenance="observed"):
-        """Join an open fork with its outcome. Consumes the record."""
+    def settle(self, tid, y, provenance=None):
+        """Join an open fork with its outcome. Consumes the record.
+
+        The class the outcome folds into is the class the fork was *asked to
+        produce* (the honored header from fork()), unless the caller passes an
+        explicit override. No silent default: a caller that passes nothing gets
+        the fork's honored class. Dissent is never quashed for observed and
+        inferred outcomes. The hallucinated class is subject to the declared
+        valence: persistent surprise is a gem (fold), one-off surprise is for-shit
+        (discard).
+
+        Note on the discard rule (v10): the gem check is trembling-only — it reads
+        bump[p] and M[p]. It cannot tell a tourmaline (persistently wrong) from a
+        diamond (persistently early). The two-timescale split and the cross-class
+        drift tracker are the machinery that separates them; until they land, this
+        rule treats tourmalines as gems. The limitation is stated, not hidden."""
         if tid not in self.ledger:
             raise KeyError(f"no open fork {tid} (expired or already settled)")
         y = np.asarray(y, float).reshape(-1)
@@ -512,7 +569,10 @@ class ForkGenerator:
             raise ValueError("settle: non-finite outcome rejected; fork stays open")
         rec = self.ledger.pop(tid)
         c = self.cfg
-        p = PROVENANCE.index(provenance)
+        p_name = provenance if provenance is not None else rec["provenance"]
+        if p_name not in PROVENANCE:
+            raise ValueError(f"settle: override provenance {p_name!r} not in {PROVENANCE}")
+        p = PROVENANCE.index(p_name)
         e = np.clip(rec["mu"] - y, -ERR_CLIP, ERR_CLIP)
         z = float(np.mean(e ** 2) / rec["unc"])
         agree = float(np.exp(-0.5 * z))
@@ -524,13 +584,26 @@ class ForkGenerator:
         self.SA[p] += agree
         if novel and kept:
             self.SNA[p] += 1.0
+
+        # Valence: only the hallucinated class can be discarded at settlement.
+        # The gem check uses the state the code carries: persistent surprise
+        # (bump at or above gem_bump) OR repeated settling (support mass at or
+        # above gem_support). Trembling-only approximation; drift tracker pending.
+        if p_name == "hallucinated" and c["valence"] == "tonic_hold":
+            gem = (self.bump[p] >= c["gem_bump"]) or (self.M[p] >= c["gem_support"])
+            if not gem:
+                self.n_discarded += 1
+                return dict(agree=agree, w=w, z=z, novel=novel,
+                            folded=False, discarded=True, gem=False)
+
         folded = w > 0.0
         if folded:
-            self.observe(rec["x"], y, w, provenance, phase=rec["phase"])
+            self.observe(rec["x"], y, w, p_name, phase=rec["phase"])
             self.n_folded += 1
         else:
             self.n_discarded += 1
-        return dict(agree=agree, w=w, z=z, novel=novel, folded=folded)
+        return dict(agree=agree, w=w, z=z, novel=novel,
+                    folded=folded, discarded=False, gem=True)
 
     def ledger_check(self):
         lhs = self.n_arr
@@ -574,13 +647,20 @@ class ForkGenerator:
             unc_err_pearson=_pearson(unc, e_s),
         )
 
+    def _discard_rate(self) -> float:
+        total = self.n_folded + self.n_discarded
+        return float(self.n_discarded) / total if total else 0.0
+
     def diagnostics(self) -> dict:
         if not self.history:
             return {}
         out = dict(initial_loss=self.history[0], final_loss=self.history[-1],
                    improvement=self.history[0] - self.history[-1],
                    steps=self.step, train_n=self.train_n, absorbed=self.absorbed,
-                   n_obs=self.n_obs, field_time=self.field_time, pi=self.pi.round(4).tolist(),
+                   n_obs=self.n_obs, field_time=self.field_time,
+                   valence=self.cfg["valence"],
+                   discard_rate=self._discard_rate(),
+                   pi=self.pi.round(4).tolist(),
                    ledger=self.ledger_check())
         if self.head_diag:
             out["heads_last"] = {k: v for k, v in self.head_diag[-1].items()
@@ -848,14 +928,54 @@ def _cmd_selftest(args):
           f"arr={led['n_arr']} folded={led['n_folded']} discarded={led['n_discarded']} "
           f"open={led['n_open']} expired={led['n_expired']}")
 
-    # 8b dissent folds at full weight: no surprising outcome is discarded at settlement
+    # 8b dissent folds at full weight for observed/inferred
     dv = ForkGenerator(seed=args.seed)
     dforks = [dv.fork(tr[i][0]).trajectory_id for i in range(20)]
-    dres = [dv.settle(t_, tr[i][1] + 10.0, "hallucinated") for i, t_ in enumerate(dforks)]
+    dres = [dv.settle(t_, tr[i][1] + 10.0, "observed") for i, t_ in enumerate(dforks)]
     min_w = min(r["w"] for r in dres)
     ok_d = all(r["folded"] for r in dres) and min_w >= 0.5 - 1e-12 and dv.n_discarded == 0
-    check("dissent folds at full weight (w >= 0.5, never discarded)", ok_d,
+    check("observed dissent folds at full weight (w >= 0.5, never discarded)", ok_d,
           f"min_w={min_w:.3f} discarded={dv.n_discarded}")
+
+    # 8c honored class: fork with header, settle without override -> folds as header
+    hc = ForkGenerator(seed=args.seed)
+    tid_h = hc.fork(tr[0][0], conditioning_tags={"provenance": "hallucinated"}).trajectory_id
+    assert hc.ledger[tid_h]["provenance"] == "hallucinated"
+    # for a for-shit hallucination (bump and M both zero), the gem check fails
+    res_h = hc.settle(tid_h, tr[0][1] + 100.0)   # big surprise -> for-shit
+    check("honored class: header routes settle; for-shit hallucinated discarded",
+          res_h["discarded"] and not res_h["folded"] and not res_h["gem"]
+          and hc.n_discarded == 1 and hc.SN[PROVENANCE.index("hallucinated")] == 1.0,
+          f"res={res_h} SN={hc.SN.tolist()}")
+
+    # 8d hallucinated gem: high bump (persistent surprise) OR high M (support) survives
+    hg = ForkGenerator(seed=args.seed)
+    hg.bump[PROVENANCE.index("hallucinated")] = hg.cfg["gem_bump"] + 0.1
+    tid_g = hg.fork(tr[1][0], conditioning_tags={"provenance": "hallucinated"}).trajectory_id
+    res_g = hg.settle(tid_g, tr[1][1])
+    check("hallucinated gem: high bump survives, folds",
+          res_g["gem"] and res_g["folded"] and not res_g["discarded"]
+          and hg.n_folded == 1 and hg.n_discarded == 0,
+          f"res={res_g}")
+
+    # 8e override: settle() with explicit provenance overrides the honored class
+    ov = ForkGenerator(seed=args.seed)
+    tid_o = ov.fork(tr[0][0], conditioning_tags={"provenance": "hallucinated"}).trajectory_id
+    res_o = ov.settle(tid_o, tr[0][1], provenance="observed")  # override to observed
+    check("settle override: explicit provenance overrides honored class",
+          res_o["folded"] and res_o["gem"] and ov.SN[PROVENANCE.index("observed")] == 1.0
+          and ov.SN[PROVENANCE.index("hallucinated")] == 0.0,
+          f"res={res_o} SN={ov.SN.tolist()}")
+
+    # 8f bad header rejected at fork
+    bh = ForkGenerator(seed=args.seed)
+    try:
+        bh.fork(tr[0][0], conditioning_tags={"provenance": "bogus"})
+        bad_rejected = False
+    except ValueError:
+        bad_rejected = True
+    check("fork rejects provenance header not in PROVENANCE", bad_rejected,
+          f"n_arr={bh.n_arr}")
 
     # 9 absorb is prediction-preserving (phase-free)
     ab = ForkGenerator(seed=args.seed)
