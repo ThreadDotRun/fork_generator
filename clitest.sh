@@ -3,11 +3,12 @@
 # cli_test.sh: black-box CLI test suite for fork_generator.py
 #
 # Usage:
-#   cli_test.sh [path/to/fork_generator.py] [-v] [--quick] [--keep]
+#   cli_test.sh [path/to/fork_generator.py] [-v] [--quick] [--keep] [--selftest-expected N]
 #     path     defaults to ../fork_generator.py relative to this script
 #     -v       print stderr tail for failing commands
 #     --quick  skip the full selftest (slowest case)
 #     --keep   keep the working directory for inspection
+#     --selftest-expected N   expected pass count from `selftest` (default 23)
 #
 # Exit: 0 all pass, 1 any failure, 2 setup error.
 # Everything runs in a temp directory. The suite never touches the source tree.
@@ -17,13 +18,16 @@ set -u
 VERBOSE=0
 QUICK=0
 KEEP=0
+SELFTEST_EXPECT=23
 FG_ARG=""
-for a in "$@"; do
+while [ $# -gt 0 ]; do
+  a="$1"; shift
   case "$a" in
     -v) VERBOSE=1 ;;
     --quick) QUICK=1 ;;
     --keep) KEEP=1 ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    --selftest-expected) SELFTEST_EXPECT="$1"; shift ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) FG_ARG="$a" ;;
   esac
 done
@@ -350,7 +354,7 @@ if [ "$QUICK" -eq 1 ]; then
 else
   run st selftest --seed 0 --epochs 60
   expect_rc st 0 "selftest exits 0"
-  has st '19/19 passed' "selftest reports 19/19"
+  has st "${SELFTEST_EXPECT}/${SELFTEST_EXPECT} passed" "selftest reports ${SELFTEST_EXPECT}/${SELFTEST_EXPECT}"
   hasnt st '^\[FAIL\]' "no selftest FAIL lines"
 fi
 
