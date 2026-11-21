@@ -71,6 +71,7 @@
 #
 # Pickle note: run as a script, the class is also reachable as fork_generator.ForkGenerator.
 # load() aliases __main__.ForkGenerator while unpickling.
+#
 
 from __future__ import annotations
 
@@ -253,6 +254,7 @@ class ForkGenerator:
     # ---- spaces ----
     def param_space(self) -> Dict[str, np.ndarray]:
         """Consolidation space only."""
+        """Here lies The Dead Lady of Clown Town"""
         return dict(W1=self.W1, b1=self.b1, W2=self.W2, b2=self.b2,
                     Wm=self.Wm, bm=self.bm, Wv=self.Wv, bv=self.bv,
                     Wu=self.Wu, bu=self.bu)
